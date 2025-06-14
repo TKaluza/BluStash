@@ -10,17 +10,24 @@ Requirements:
 - Python ≥3.12
 - SQLAlchemy ≥2.0
 """
+
 from __future__ import annotations
 import os
 from pathlib import Path
+from datetime import datetime, timezone
+import uuid
 from sqlalchemy import (
-    BigInteger, Integer, String, LargeBinary, Boolean,
-    ForeignKey, Index,
+    BigInteger,
+    Integer,
+    String,
+    LargeBinary,
+    Boolean,
+    ForeignKey,
+    Index,
+    DateTime,
 )
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.orm import (
-    Mapped, mapped_column, relationship, registry
-)
+from sqlalchemy.orm import Mapped, mapped_column, relationship, registry
 from dotenv import load_dotenv
 
 from xxhash import xxh32_intdigest, xxh3_128_hexdigest
@@ -29,6 +36,32 @@ from xxhash import xxh32_intdigest, xxh3_128_hexdigest
 load_dotenv()
 
 reg = registry()
+
+def current_epoch()->int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+def new_uuid()->str:
+    return str(uuid.uuid1())
+
+@reg.mapped_as_dataclass()
+class ScanSession:
+    """Represents a single run of the BluStash scanner."""
+
+    __tablename__ = "scan_session"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, init=False)
+    uuid: Mapped[str] = mapped_column(
+        String(36), unique=True, nullable=False, default_factory=new_uuid
+    )
+    started_at: Mapped[int] = mapped_column(
+        Integer, nullable=False, default_factory=current_epoch
+    )
+    changed_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    files: Mapped[list["File"]] = relationship(
+        back_populates="session", default_factory=list
+    )
+
 
 @reg.mapped_as_dataclass()
 class Dir:
@@ -44,18 +77,19 @@ class Dir:
     """
     __tablename__ = "dir"
 
-    id: Mapped[int]      = mapped_column(Integer, primary_key=True, init=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, init=False)
 
     # ── put *non-default* column first
-    name: Mapped[str]    = mapped_column(String, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
     full_path_hash: Mapped[int] = mapped_column(Integer, nullable=False)
-
 
     # ── defaulted columns may
     parent_id: Mapped[int | None] = mapped_column(
         ForeignKey("dir.id", ondelete="CASCADE"), default=None
     )
-    is_valid:Mapped[bool] = mapped_column(Boolean, default=True, nullable=False) # Hinzugefügt
+    is_valid: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )  # Hinzugefügt
 
     # self-referential relationship: use a lambda so Dir.id is defined
     parent: Mapped["Dir | None"] = relationship(
@@ -144,20 +178,31 @@ class File:
     The model uses xxHash128 for efficient content hashing, which allows for
     quick file identification and comparison.
     """
+
     __tablename__ = "file"
 
-    id:         Mapped[int]   = mapped_column(Integer, primary_key=True, init=False)
-    dir_id: Mapped[int] = mapped_column(ForeignKey("dir.id", ondelete="CASCADE"), init=False)
-    name:       Mapped[str]   = mapped_column(String, nullable=False)
-    size:       Mapped[int]   = mapped_column(BigInteger, nullable=False)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, init=False)
+    dir_id: Mapped[int] = mapped_column(
+        ForeignKey("dir.id", ondelete="CASCADE"), init=False
+    )
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("scan_session.id", ondelete="CASCADE"), init=False
+    )
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     hash_xx128: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
 
     dir: Mapped["Dir"] = relationship(back_populates="files")
+    session: Mapped["ScanSession"] = relationship(back_populates="files")
+    ancestor: Mapped["File | None"] = relationship(remote_side=lambda: File.id)
+    ancestor_id: Mapped[int | None] = mapped_column(ForeignKey("file.id"), default=None)
     is_safed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    is_valid:Mapped[bool] = mapped_column(Boolean, default=True, nullable=False) # Hinzugefügt
+    is_valid: Mapped[bool] = mapped_column(
+        Boolean, default=True, nullable=False
+    )  # Hinzugefügt
 
     __table_args__ = (
-        Index("ux_file_dir_name", "dir_id", "name", unique=True),
+        Index("ix_file_dir_name_session", "dir_id", "name", "session_id", unique=True),
     )
 
     @property
@@ -172,6 +217,7 @@ class File:
             Path: A Path object representing the absolute path of this file
         """
         return self.dir.full_path / self.name
+
 
 # ── async engine / session ───────────────────────────────────────────
 # Get database path from environment variable or use default
