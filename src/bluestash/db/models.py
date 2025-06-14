@@ -1,4 +1,15 @@
-# db/models.py  – Python ≥3.12, SQLAlchemy ≥2.0
+"""
+Database Models for BluStash File System Indexing
+
+This module defines the SQLAlchemy ORM models used to store file system information.
+It includes models for directories and files, with relationships between them to
+represent the file system hierarchy. The models use xxHash for efficient path and
+content hashing.
+
+Requirements:
+- Python ≥3.12
+- SQLAlchemy ≥2.0
+"""
 from __future__ import annotations
 from pathlib import Path
 from sqlalchemy import (
@@ -16,6 +27,16 @@ reg = registry()
 
 @reg.mapped_as_dataclass()
 class Dir:
+    """
+    Directory model representing a directory in the file system.
+
+    This class maps to the 'dir' table in the database and stores information
+    about directories including their name, path hash, and relationships to
+    parent directories and child elements (subdirectories and files).
+
+    The model uses a self-referential relationship to represent the directory
+    hierarchy, allowing for efficient traversal of the file system structure.
+    """
     __tablename__ = "dir"
 
     id: Mapped[int]      = mapped_column(Integer, primary_key=True, init=False)
@@ -57,6 +78,16 @@ class Dir:
 
     @property
     def full_path(self) -> Path:
+        """
+        Calculate and return the full absolute path of this directory.
+
+        This property traverses the directory hierarchy upwards through parent
+        relationships, collecting directory names along the way, and then
+        constructs a Path object representing the absolute path from the root.
+
+        Returns:
+            Path: A Path object representing the absolute path of this directory
+        """
         node, parts = self, []
         while node:
             parts.append(node.name)
@@ -66,20 +97,44 @@ class Dir:
     @staticmethod
     def compute_full_path_hash(path: Path) -> int:
         """
-        Berechnet den xxHash64-Wert für einen gegebenen Pfad.
+        Compute the xxHash32 integer digest value for a given path.
+
+        This method converts the path to a string and calculates a hash value
+        that can be used for efficient path lookups in the database.
+
+        Args:
+            path (Path): The path to hash
+
+        Returns:
+            int: The xxHash32 integer digest of the path string
         """
         return xxh32_intdigest(str(path))
 
     def set_full_path_hash(self):
         """
-        Setzt den Hashwert für den aktuellen Verzeichnispfad neu.
-        Sollte nach jeder Änderung von Name/Elternverzeichnis aufgerufen werden.
+        Update the hash value for the current directory path.
+
+        This method should be called after any change to the directory's name
+        or parent directory to ensure the hash value remains consistent with
+        the actual path.
+
+        The hash value is used for efficient lookups and to verify path integrity.
         """
         self.full_path_hash = self.compute_full_path_hash(self.full_path)
 
 
 @reg.mapped_as_dataclass()
 class File:
+    """
+    File model representing a file in the file system.
+
+    This class maps to the 'file' table in the database and stores information
+    about files including their name, size, content hash, and relationship to
+    their parent directory.
+
+    The model uses xxHash128 for efficient content hashing, which allows for
+    quick file identification and comparison.
+    """
     __tablename__ = "file"
 
     id:         Mapped[int]   = mapped_column(Integer, primary_key=True, init=False)
@@ -96,6 +151,15 @@ class File:
 
     @property
     def path(self) -> Path:
+        """
+        Calculate and return the full absolute path of this file.
+
+        This property combines the parent directory's full path with the file's name
+        to create a complete path to the file in the file system.
+
+        Returns:
+            Path: A Path object representing the absolute path of this file
+        """
         return self.dir.full_path / self.name
 
 # ── async engine / session ───────────────────────────────────────────
