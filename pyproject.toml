@@ -1,0 +1,12 @@
+[project]
+name = "blustash"
+version = "0.0.1"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "aiosqlite>=0.21.0",
+    "rich>=14.0.0",
+    "sqlalchemy>=2.0.41",
+    "xxhash>=3.5.0",
+]
