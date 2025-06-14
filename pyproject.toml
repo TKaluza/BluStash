@@ -13,5 +13,8 @@ dependencies = [
     "python-dotenv>=1.0.0",
 ]
 
+[tool.uv]
+package = true
+
 [project.scripts]
 bluestash = "bluestash.cli:app"

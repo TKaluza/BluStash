@@ -15,17 +15,13 @@ from contextlib import asynccontextmanager
 import logging
 from xxhash import xxh3_128_hexdigest
 import os
+from typing import Optional, Callable
 
 from bluestash.db.models import Dir, File, AsyncSession
 
 logger = logging.getLogger("fs_index")
 logger.setLevel(logging.INFO)
-# Use LOG_PATH from environment variables with fallback to default
-log_path = os.environ.get("LOG_PATH", "fs_index.log")
-# Expand user path if it starts with ~
-if log_path.startswith("~"):
-    log_path = os.path.expanduser(log_path)
-handler = logging.FileHandler(log_path)
+handler = logging.FileHandler("fs_index.log")
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
@@ -70,57 +66,32 @@ async def get_size_and_hash(file_path: Path):
     return await asyncio.to_thread(read_and_hash)
 
 
-async def count_dirs_and_files(start_path: Path, exclude_paths=None):
+async def count_dirs_and_files(start_path: Path):
     """
     Recursively count the total number of directories and files (excluding symlinks).
 
     This function traverses the directory structure starting from the given path
-    and counts all directories and files, excluding symbolic links and paths in exclude_paths.
-    The counts can be used for progress bars or status reporting during scanning operations.
+    and counts all directories and files, excluding symbolic links. The counts
+    can be used for progress bars or status reporting during scanning operations.
 
     Args:
         start_path (Path): The root directory to start counting from
-        exclude_paths (list, optional): List of paths to exclude from counting
 
     Returns:
         tuple: A tuple containing (dir_count, file_count) where:
             - dir_count (int): Total number of directories (including the root)
             - file_count (int): Total number of files
     """
-    # Default to empty list if None
-    if exclude_paths is None:
-        exclude_paths = []
-
-    # Convert all exclude paths to absolute and resolved paths
-    exclude_paths = [Path(p).expanduser().resolve() for p in exclude_paths]
     dir_count = 0
     file_count = 0
     loop = asyncio.get_running_loop()
 
     for root, dirs, files in await loop.run_in_executor(None, lambda: list(os.walk(start_path, followlinks=False))):
-        # Filter out excluded directories
-        dirs_to_count = []
+        dir_count += len(dirs)  # Unterverzeichnisse
         for d in dirs:
             d_path = Path(root) / d
             if d_path.is_symlink():
                 continue
-
-            # Skip if path is in exclude_paths
-            resolved_path = d_path.resolve()
-            skip = False
-            for exclude_path in exclude_paths:
-                if resolved_path == exclude_path or resolved_path.is_relative_to(exclude_path):
-                    logger.info(f"Skipping excluded path in counting: {d_path}")
-                    skip = True
-                    break
-
-            if not skip:
-                dirs_to_count.append(d)
-
-        # Update dirs in-place to affect the walk
-        dirs[:] = dirs_to_count
-        dir_count += len(dirs_to_count)
-
         for f in files:
             f_path = Path(root) / f
             if f_path.is_symlink():
@@ -130,66 +101,76 @@ async def count_dirs_and_files(start_path: Path, exclude_paths=None):
 
     return dir_count, file_count
 
-async def insert_dirs(start_path: Path, session, parent_dir_obj=None):
-    """
-    Recursively insert the entire directory structure starting from start_path into the database.
 
-    This function creates a Dir object for the given path, adds it to the database session,
-    and then recursively processes all subdirectories. It handles the parent-child relationships
-    between directories to maintain the hierarchical structure.
+async def scan_dirs_and_build_lookup(start_path: Path, session,
+                                     total_dirs: int,
+                                     progress_callback: Optional[Callable[[int, int], None]] = None) -> dict[Path, Dir]:
+    """
+    Recursively walk directory structure, add directories to the database, and build a lookup.
+
+    This function traverses the directory structure, creates Dir objects
+    for each directory, and maintains the parent-child relationships. It also
+    builds a lookup dictionary mapping paths to Dir objects for later use.
+    It reports progress specifically for directory scanning.
 
     Args:
-        start_path (Path): The directory path to insert
-        session: The database session to use for the operation
-        parent_dir_obj (Dir, optional): The parent Dir object, or None for the root directory
+        start_path (Path): The root directory to start scanning from.
+        session: The database session to use for the operation.
+        total_dirs (int): The total number of directories expected (for progress).
+        progress_callback (Callable[[int, int], None], optional):
+            A callback function that will be called with (current_dirs, total_dirs).
 
     Returns:
-        Dir: The Dir object created for start_path, or None if start_path is a symlink
+        dict[Path, Dir]: A dictionary mapping Path objects to Dir objects.
     """
-    if start_path.is_symlink():
-        return None
+    dir_lookup = {}
+    current_dirs_processed = [0] # Mutable list for callback
 
-    dir_obj = Dir(
-        name=start_path.name,
-        full_path_hash=Dir.compute_full_path_hash(start_path),
-        parent=parent_dir_obj
-    )
-    session.add(dir_obj)
-    await session.flush()  # id gesetzt
-    # Rekursiv für Unterverzeichnisse
-    try:
-        for entry in await asyncio.to_thread(lambda: list(start_path.iterdir())):
-            if entry.is_dir() and not entry.is_symlink():
-                await insert_dirs(entry, session, dir_obj)
-    except Exception as e:
-        logger.error(f"Error reading directory {start_path}: {e}")
-    return dir_obj
+    async def walk_dirs_internal(path, parent_obj=None):
+        if path.is_symlink():
+            return
+        dir_obj = Dir(
+            name=path.name,
+            full_path_hash=Dir.compute_full_path_hash(path),
+            parent=parent_obj
+        )
+        session.add(dir_obj)
+        await session.flush()
+        dir_lookup[path] = dir_obj
 
-async def insert_files(session, dir_lookup: dict):
+        current_dirs_processed[0] += 1
+        if progress_callback:
+            progress_callback(current_dirs_processed[0], total_dirs)
+
+        try:
+            for entry in await asyncio.to_thread(lambda: list(path.iterdir())):
+                if entry.is_dir() and not entry.is_symlink():
+                    await walk_dirs_internal(entry, dir_obj)
+        except Exception as e:
+            logger.error(f"Error reading directory {path}: {e}")
+
+    await walk_dirs_internal(start_path)
+    return dir_lookup
+
+
+async def insert_files_with_progress(session, dir_lookup: dict,
+                                     total_files: int,
+                                     progress_callback: Optional[Callable[[int, int], None]] = None):
     """
     Insert all files from all directories into the database with xxHash128 and size.
-
-    This function iterates over all non-symlink files in all directories and adds them
-    to the database with their xxHash128 hash and size. It uses a dictionary that maps
-    directory paths to Dir objects for efficient lookups.
+    This function reports progress specifically for file insertion.
 
     Args:
-        session: The database session to use for the operation
-        dir_lookup (dict): A dictionary mapping Path objects to Dir objects
+        session: The database session to use for the operation.
+        dir_lookup (dict): A dictionary mapping Path objects to Dir objects.
+        total_files (int): The total number of files expected (for progress).
+        progress_callback (Callable[[int, int], None], optional):
+            A callback function that will be called with (current_files, total_files).
     """
+    current_files_processed_ref = [0] # Mutable list for callback
     tasks = []
 
     async def process_file(file_path: Path, dir_obj):
-        """
-        Process a single file by calculating its hash and size and adding it to the database.
-
-        This nested function checks if the path is a valid file (not a symlink),
-        calculates its size and hash, creates a File object, and adds it to the database session.
-
-        Args:
-            file_path (Path): The path to the file to process
-            dir_obj (Dir): The Dir object representing the file's parent directory
-        """
         if file_path.is_symlink() or not file_path.is_file():
             return
         try:
@@ -201,81 +182,19 @@ async def insert_files(session, dir_lookup: dict):
                 hash_xx128=hash_val
             )
             session.add(file_obj)
+            current_files_processed_ref[0] += 1
+            if progress_callback:
+                progress_callback(current_files_processed_ref[0], total_files)
         except Exception as e:
             logger.error(f"Error reading {file_path}: {e}")
 
+    file_processing_tasks = []
     for dir_path, dir_obj in dir_lookup.items():
         try:
             for entry in await asyncio.to_thread(lambda: list(dir_path.iterdir())):
                 if entry.is_file() and not entry.is_symlink():
-                    tasks.append(asyncio.create_task(process_file(entry, dir_obj)))
+                    file_processing_tasks.append(process_file(entry, dir_obj))
         except Exception as e:
             logger.error(f"Error reading directory {dir_path}: {e}")
 
-    await asyncio.gather(*tasks)
-
-async def scan_and_store(start_path: Path, exclude_paths=None):
-    """
-    Execute the complete file system scanning and indexing process.
-
-    This function performs the entire scanning and indexing workflow:
-    1. Count directories and files (for progress reporting)
-    2. Insert all directories into the database
-    3. Insert all files into the database (including size and hash)
-
-    Args:
-        start_path (Path): The root directory to start scanning from
-        exclude_paths (list, optional): List of paths to exclude from scanning
-    """
-    # Default to empty list if None
-    if exclude_paths is None:
-        exclude_paths = []
-
-    # Convert all exclude paths to absolute and resolved paths
-    exclude_paths = [Path(p).expanduser().resolve() for p in exclude_paths]
-    async with get_async_session() as session:
-        dir_count, file_count = await count_dirs_and_files(start_path, exclude_paths)
-        logger.info(f"Scanning {dir_count} directories and {file_count} files under {start_path}")
-
-        dir_lookup = {}
-
-        async def walk_dirs(path, parent_obj=None):
-            """
-            Recursively walk directory structure and add directories to the database.
-
-            This nested function traverses the directory structure, creates Dir objects
-            for each directory, and maintains the parent-child relationships. It also
-            builds a lookup dictionary mapping paths to Dir objects for later use.
-
-            Args:
-                path (Path): The directory path to process
-                parent_obj (Dir, optional): The parent Dir object, or None for the root
-            """
-            # Skip if path is a symlink or in exclude_paths
-            if path.is_symlink():
-                return
-
-            # Skip if path is in exclude_paths
-            resolved_path = path.resolve()
-            for exclude_path in exclude_paths:
-                if resolved_path == exclude_path or resolved_path.is_relative_to(exclude_path):
-                    logger.info(f"Skipping excluded path: {path}")
-                    return
-            dir_obj = Dir(
-                name=path.name,
-                full_path_hash=Dir.compute_full_path_hash(path),
-                parent=parent_obj
-            )
-            session.add(dir_obj)
-            await session.flush()
-            dir_lookup[path] = dir_obj
-            try:
-                for entry in await asyncio.to_thread(lambda: list(path.iterdir())):
-                    if entry.is_dir() and not entry.is_symlink():
-                        await walk_dirs(entry, dir_obj)
-            except Exception as e:
-                logger.error(f"Error reading directory {path}: {e}")
-
-        await walk_dirs(start_path)
-        await insert_files(session, dir_lookup)
-        await session.commit()
+    await asyncio.gather(*[asyncio.create_task(t) for t in file_processing_tasks])
