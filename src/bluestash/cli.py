@@ -140,9 +140,8 @@ def scan_command(
         # Use async context manager for database session
         async with get_async_session() as session:
             try:
+                # Create a ScanSession but don't add it to the session yet
                 scan_session = ScanSession()
-                session.add(scan_session)
-                await session.flush()
 
                 # Vor dem Scan: Alle is_valid-Flags auf False setzen
                 await reset_all_valid_flags(session)
@@ -232,8 +231,15 @@ def scan_command(
                         scan_session,
                         progress_callback=update_file_progress,
                     )
-                    scan_session.changed_files = processed
-                    await session.flush()
+
+                    # Update the changed_files count if there were changes
+                    changed_files = processed
+                    if processed > 0:
+                        scan_session.changed_files = changed_files
+                        # No need to add scan_session to the session again as it's already added
+                        # in insert_files_with_progress when the first change is detected
+                        logger.info(f"Recorded {changed_files} changed files")
+
                     progress_file.update(
                         file_task,
                         completed=total_files,
@@ -243,8 +249,26 @@ def scan_command(
                     logger.info("File processing completed.")
 
                 # Nach dem Scan: Ungültige Einträge löschen
-                # await delete_invalid_entries(session)
-                # console.print("[bold blue]Ungültige Einträge aus der Datenbank entfernt.[/bold blue]")
+                deleted_files = await delete_invalid_entries(session)
+                console.print(f"[bold blue]Ungültige Einträge aus der Datenbank entfernt: {deleted_files} Dateien.[/bold blue]")
+
+                # If files were deleted, count them as changes
+                if deleted_files > 0:
+                    # If no files were changed before but some were deleted, add the scan_session to the session
+                    if changed_files == 0:
+                        session.add(scan_session)
+                        await session.flush()  # Ensure scan_session gets its ID
+
+                    # Update the changed_files count to include deleted files
+                    changed_files += deleted_files
+                    scan_session.changed_files = changed_files
+                    logger.info(f"Updated changed_files count to include {deleted_files} deleted files, total: {changed_files}")
+
+                # Log the final status
+                if changed_files > 0:
+                    logger.info(f"Recorded scan session with {changed_files} total changed files")
+                else:
+                    logger.info("No changes detected, not recording scan session")
 
                 # PHASE 5: Finalizing (Spinner)
                 logger.info("Finalizing database transactions...")
@@ -254,7 +278,11 @@ def scan_command(
                     # Der commit wurde bereits in insert_files_with_progress nach jedem Chunk durchgeführt
                     # Ein finaler commit hier ist redundant, wenn alle Chunks committed wurden
                     # aber kann nicht schaden, falls noch pending changes vom Dir-Scan sind
+
+                    # Commit any pending changes (directory updates, etc.)
+                    # If no files were changed, this won't include a ScanSession
                     await session.commit()
+
                     status.update(
                         "[bold green]Datenbank-Transaktionen abgeschlossen.[/bold green]"
                     )

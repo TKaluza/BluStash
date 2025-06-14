@@ -234,6 +234,11 @@ async def insert_files_with_progress(
                     f"File {file_path.name} in {dir_obj.name} exists and is valid. No update needed."
                 )
             else:
+                # If this is the first changed file, add the scan_session to the database session
+                if changed_files_count == 0:
+                    session.add(scan_session)
+                    await session.flush()  # Ensure scan_session gets its ID
+
                 file_obj = File(
                     name=file_path.name,
                     dir=dir_obj,
@@ -294,6 +299,9 @@ async def delete_invalid_entries(session):
     """
     Deletes Dir and File entries that still have is_valid=False after a scan.
     These entries represent files or directories that no longer exist on the file system.
+
+    Returns:
+        int: The number of deleted file entries
     """
     logger.info("Deleting invalid entries (is_valid=False)...")
 
@@ -301,7 +309,8 @@ async def delete_invalid_entries(session):
     deleted_files_count = await session.execute(
         delete(File).where(File.is_valid == False)
     )
-    logger.info(f"Deleted {deleted_files_count.rowcount} invalid file entries.")
+    deleted_files = deleted_files_count.rowcount
+    logger.info(f"Deleted {deleted_files} invalid file entries.")
 
     # Delete directories next. Ensure directories are only deleted if they have no valid children or files.
     # This might require a more complex query or multiple passes if there are nested invalid directories
@@ -313,6 +322,8 @@ async def delete_invalid_entries(session):
 
     await session.commit()
     logger.info("Invalid entries deleted.")
+
+    return deleted_files
 
 
 async def get_latest_session_info(session):
