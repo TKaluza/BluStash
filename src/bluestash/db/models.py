@@ -149,6 +149,7 @@ class File:
     hash_xx128: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
 
     dir: Mapped["Dir"] = relationship(back_populates="files")
+    is_safed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     __table_args__ = (
         Index("ux_file_dir_name", "dir_id", "name", unique=True),

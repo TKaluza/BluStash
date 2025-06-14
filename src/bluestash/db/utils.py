@@ -20,7 +20,12 @@ from bluestash.db.models import Dir, File, AsyncSession
 
 logger = logging.getLogger("fs_index")
 logger.setLevel(logging.INFO)
-handler = logging.FileHandler("fs_index.log")
+# Use LOG_PATH from environment variables with fallback to default
+log_path = os.environ.get("LOG_PATH", "fs_index.log")
+# Expand user path if it starts with ~
+if log_path.startswith("~"):
+    log_path = os.path.expanduser(log_path)
+handler = logging.FileHandler(log_path)
 formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
