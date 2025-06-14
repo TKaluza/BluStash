@@ -55,6 +55,7 @@ class Dir:
     parent_id: Mapped[int | None] = mapped_column(
         ForeignKey("dir.id", ondelete="CASCADE"), default=None
     )
+    is_valid:Mapped[bool] = mapped_column(Boolean, default=True, nullable=False) # Hinzugefügt
 
     # self-referential relationship: use a lambda so Dir.id is defined
     parent: Mapped["Dir | None"] = relationship(
@@ -80,6 +81,9 @@ class Dir:
         Index("ux_dir_parent_name", "parent_id", "name", unique=True),
         Index("ix_dir_full_path_hash", "full_path_hash"),
     )
+
+    def __repr__(self):
+        return f"<Dir(name='{self.name}', full_path_hash={self.full_path_hash})>"
 
     @property
     def full_path(self) -> Path:
@@ -150,6 +154,7 @@ class File:
 
     dir: Mapped["Dir"] = relationship(back_populates="files")
     is_safed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_valid:Mapped[bool] = mapped_column(Boolean, default=True, nullable=False) # Hinzugefügt
 
     __table_args__ = (
         Index("ux_file_dir_name", "dir_id", "name", unique=True),

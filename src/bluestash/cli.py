@@ -17,7 +17,14 @@ from sqlalchemy.exc import IntegrityError
 from dotenv import load_dotenv
 
 from bluestash.db.models import reg, engine
-from bluestash.db.utils import (count_dirs_and_files, scan_dirs_and_build_lookup, insert_files_with_progress, get_async_session)
+from bluestash.db.utils import (
+    count_dirs_and_files,
+    scan_dirs_and_build_lookup,
+    insert_files_with_progress,
+    get_async_session,
+    reset_all_valid_flags, # Importiert
+    delete_invalid_entries # Importiert
+)
 from bluestash import setup_logging
 
 
@@ -112,18 +119,21 @@ def scan_command(
 
         total_dirs, total_files = 0, 0
 
-        # PHASE 1: Initial Counting (Spinner)
-        logger.info("Counting directories and files...")
-        with console.status("[bold blue]Zähle Verzeichnisse und Dateien...", spinner="dots") as status:
-            total_dirs, total_files = await count_dirs_and_files(basis_pfad)
-            status.update("[bold green]Zählung abgeschlossen.[/bold green]")
-        console.print(f"[bold green]Gefunden: {total_dirs} Verzeichnisse und {total_files} Dateien.[/bold green]")
-        logger.info(f"Found: {total_dirs} directories and {total_files} files.")
-
-
         # Use async context manager for database session
         async with get_async_session() as session:
             try:
+                # Vor dem Scan: Alle is_valid-Flags auf False setzen
+                await reset_all_valid_flags(session)
+                console.print("[bold blue]Vorhandene Einträge auf Ungültig gesetzt.[/bold blue]")
+
+                # PHASE 1: Initial Counting (Spinner)
+                logger.info("Counting directories and files...")
+                with console.status("[bold blue]Zähle Verzeichnisse und Dateien...", spinner="dots") as status:
+                    total_dirs, total_files = await count_dirs_and_files(basis_pfad)
+                    status.update("[bold green]Zählung abgeschlossen.[/bold green]")
+                console.print(f"[bold green]Gefunden: {total_dirs} Verzeichnisse und {total_files} Dateien.[/bold green]")
+                logger.info(f"Found: {total_dirs} directories and {total_files} files.")
+
                 # PHASE 2: Directory Scanning (Progress Bar)
                 with Progress(
                     TextColumn("[progress.description]{task.description}"),
@@ -176,10 +186,18 @@ def scan_command(
                     progress_file.stop() # Beendet den Fortschrittsbalken für Dateien
                     logger.info("File processing completed.")
 
+                # Nach dem Scan: Ungültige Einträge löschen
+                #await delete_invalid_entries(session)
+                #console.print("[bold blue]Ungültige Einträge aus der Datenbank entfernt.[/bold blue]")
+
+
                 # PHASE 5: Finalizing (Spinner)
                 logger.info("Finalizing database transactions...")
                 with console.status("[bold green]Finalisiere Datenbank-Transaktionen...", spinner="dots") as status:
-                    await session.commit() # Datenbank-Commit hier
+                    # Der commit wurde bereits in insert_files_with_progress nach jedem Chunk durchgeführt
+                    # Ein finaler commit hier ist redundant, wenn alle Chunks committed wurden
+                    # aber kann nicht schaden, falls noch pending changes vom Dir-Scan sind
+                    await session.commit()
                     status.update("[bold green]Datenbank-Transaktionen abgeschlossen.[/bold green]")
                     await asyncio.sleep(0.5) # Simuliert eine kurze abschließende Verzögerung
                 logger.info("Database transactions completed.")
