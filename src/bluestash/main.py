@@ -6,11 +6,16 @@ and storing the information in a database. It creates necessary database
 tables and initiates the scanning process from a specified root directory.
 """
 import asyncio
+import os
 from pathlib import Path
 from sqlalchemy.exc import IntegrityError
+from dotenv import load_dotenv
 
 from db.models import reg, engine
 from db.utils import scan_and_store
+
+# Load environment variables from .env file
+load_dotenv()
 
 async def main():
     """
@@ -31,8 +36,14 @@ async def main():
 
     # Scan and store everything from the desired root path
     basis_pfad = Path("/home/tim/Documents")  # <-- Replace with the actual start path!
+
+    # Get user's home directory to exclude from scan
+    home_dir = Path.home()
+    print(f"Benutzerverzeichnis wird vom Scan ausgeschlossen: {home_dir}")
+
     try:
-        await scan_and_store(basis_pfad)
+        # Call scan_and_store with the home directory as an exclude path
+        await scan_and_store(basis_pfad, exclude_paths=[home_dir])
     except IntegrityError as e:
         print(f"Integritätsfehler (vermutlich doppelte Einträge?): {e}")
     except Exception as e:

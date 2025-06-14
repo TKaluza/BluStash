@@ -65,32 +65,57 @@ async def get_size_and_hash(file_path: Path):
     return await asyncio.to_thread(read_and_hash)
 
 
-async def count_dirs_and_files(start_path: Path):
+async def count_dirs_and_files(start_path: Path, exclude_paths=None):
     """
     Recursively count the total number of directories and files (excluding symlinks).
 
     This function traverses the directory structure starting from the given path
-    and counts all directories and files, excluding symbolic links. The counts
-    can be used for progress bars or status reporting during scanning operations.
+    and counts all directories and files, excluding symbolic links and paths in exclude_paths.
+    The counts can be used for progress bars or status reporting during scanning operations.
 
     Args:
         start_path (Path): The root directory to start counting from
+        exclude_paths (list, optional): List of paths to exclude from counting
 
     Returns:
         tuple: A tuple containing (dir_count, file_count) where:
             - dir_count (int): Total number of directories (including the root)
             - file_count (int): Total number of files
     """
+    # Default to empty list if None
+    if exclude_paths is None:
+        exclude_paths = []
+
+    # Convert all exclude paths to absolute and resolved paths
+    exclude_paths = [Path(p).expanduser().resolve() for p in exclude_paths]
     dir_count = 0
     file_count = 0
     loop = asyncio.get_running_loop()
 
     for root, dirs, files in await loop.run_in_executor(None, lambda: list(os.walk(start_path, followlinks=False))):
-        dir_count += len(dirs)  # Unterverzeichnisse
+        # Filter out excluded directories
+        dirs_to_count = []
         for d in dirs:
             d_path = Path(root) / d
             if d_path.is_symlink():
                 continue
+
+            # Skip if path is in exclude_paths
+            resolved_path = d_path.resolve()
+            skip = False
+            for exclude_path in exclude_paths:
+                if resolved_path == exclude_path or resolved_path.is_relative_to(exclude_path):
+                    logger.info(f"Skipping excluded path in counting: {d_path}")
+                    skip = True
+                    break
+
+            if not skip:
+                dirs_to_count.append(d)
+
+        # Update dirs in-place to affect the walk
+        dirs[:] = dirs_to_count
+        dir_count += len(dirs_to_count)
+
         for f in files:
             f_path = Path(root) / f
             if f_path.is_symlink():
@@ -135,7 +160,7 @@ async def insert_dirs(start_path: Path, session, parent_dir_obj=None):
         logger.error(f"Error reading directory {start_path}: {e}")
     return dir_obj
 
-async def insert_files(start_path: Path, session, dir_lookup: dict):
+async def insert_files(session, dir_lookup: dict):
     """
     Insert all files from all directories into the database with xxHash128 and size.
 
@@ -144,7 +169,6 @@ async def insert_files(start_path: Path, session, dir_lookup: dict):
     directory paths to Dir objects for efficient lookups.
 
     Args:
-        start_path (Path): The root directory to start from
         session: The database session to use for the operation
         dir_lookup (dict): A dictionary mapping Path objects to Dir objects
     """
@@ -185,7 +209,7 @@ async def insert_files(start_path: Path, session, dir_lookup: dict):
 
     await asyncio.gather(*tasks)
 
-async def scan_and_store(start_path: Path):
+async def scan_and_store(start_path: Path, exclude_paths=None):
     """
     Execute the complete file system scanning and indexing process.
 
@@ -196,9 +220,16 @@ async def scan_and_store(start_path: Path):
 
     Args:
         start_path (Path): The root directory to start scanning from
+        exclude_paths (list, optional): List of paths to exclude from scanning
     """
+    # Default to empty list if None
+    if exclude_paths is None:
+        exclude_paths = []
+
+    # Convert all exclude paths to absolute and resolved paths
+    exclude_paths = [Path(p).expanduser().resolve() for p in exclude_paths]
     async with get_async_session() as session:
-        dir_count, file_count = await count_dirs_and_files(start_path)
+        dir_count, file_count = await count_dirs_and_files(start_path, exclude_paths)
         logger.info(f"Scanning {dir_count} directories and {file_count} files under {start_path}")
 
         dir_lookup = {}
@@ -215,8 +246,16 @@ async def scan_and_store(start_path: Path):
                 path (Path): The directory path to process
                 parent_obj (Dir, optional): The parent Dir object, or None for the root
             """
+            # Skip if path is a symlink or in exclude_paths
             if path.is_symlink():
                 return
+
+            # Skip if path is in exclude_paths
+            resolved_path = path.resolve()
+            for exclude_path in exclude_paths:
+                if resolved_path == exclude_path or resolved_path.is_relative_to(exclude_path):
+                    logger.info(f"Skipping excluded path: {path}")
+                    return
             dir_obj = Dir(
                 name=path.name,
                 full_path_hash=Dir.compute_full_path_hash(path),
@@ -233,5 +272,5 @@ async def scan_and_store(start_path: Path):
                 logger.error(f"Error reading directory {path}: {e}")
 
         await walk_dirs(start_path)
-        await insert_files(start_path, session, dir_lookup)
+        await insert_files(session, dir_lookup)
         await session.commit()

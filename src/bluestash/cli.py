@@ -6,14 +6,19 @@ It allows users to scan directories and index their contents in a database throu
 simple command-line commands.
 """
 import asyncio
+import os
 from pathlib import Path
 
 import typer
 from rich.console import Console
 from sqlalchemy.exc import IntegrityError
+from dotenv import load_dotenv
 
 from bluestash.db.models import reg, engine
 from bluestash.db.utils import (scan_and_store)
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = typer.Typer(help="Ein CLI-Tool zur Verwaltung des Dateisystemindex.")
 console = Console()
@@ -28,6 +33,12 @@ def scan_command(
         readable=True,
         resolve_path=True,
         help="Der Basispfad, ab dem der Scan gestartet werden soll."
+    ),
+    db_path: str = typer.Option(
+        None,
+        "--db-path",
+        "-d",
+        help="Pfad zur Datenbank-Datei. Standardmäßig wird der Wert aus der .env-Datei verwendet."
     )
 ):
     """
@@ -41,11 +52,24 @@ def scan_command(
 
     The command handles errors gracefully and provides colorful console output
     to indicate progress and status.
+
+    The database path can be specified using the --db-path option. If not provided,
+    the path from the .env file will be used. The default location is in the user's
+    home directory.
     """
     async def _scan():
+        # If db_path is provided, set it as an environment variable
+        if db_path:
+            os.environ["DB_PATH"] = db_path
+            # Re-import engine with the updated environment variable
+            from bluestash.db.models import engine as updated_engine
+            current_engine = updated_engine
+        else:
+            current_engine = engine
+
         console.print("[bold green]Tabellen werden initialisiert...[/bold green]")
         try:
-            async with engine.begin() as conn:
+            async with current_engine.begin() as conn:
                 await conn.run_sync(reg.metadata.create_all)
             console.print("[bold green]Tabellen sind bereit.[/bold green]")
         except Exception as e:
@@ -54,7 +78,12 @@ def scan_command(
 
         console.print(f"[bold blue]Starte Scan ab Pfad: {basis_pfad}[/bold blue]")
         try:
-            await scan_and_store(basis_pfad)
+            # Get user's home directory to exclude from scan
+            home_dir = Path.home()
+            console.print(f"[bold blue]Benutzerverzeichnis wird vom Scan ausgeschlossen: {home_dir}[/bold blue]")
+
+            # Call scan_and_store with the home directory as an exclude path
+            await scan_and_store(basis_pfad, exclude_paths=[home_dir])
             console.print("[bold green]Scan abgeschlossen, Datenbank ist aktuell.[/bold green]")
         except IntegrityError as e:
             console.print(f"[bold yellow]Integritätsfehler (vermutlich doppelte Einträge?): {e}[/bold yellow]")

@@ -11,6 +11,7 @@ Requirements:
 - SQLAlchemy ≥2.0
 """
 from __future__ import annotations
+import os
 from pathlib import Path
 from sqlalchemy import (
     BigInteger, Integer, String, LargeBinary, Boolean,
@@ -20,8 +21,12 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import (
     Mapped, mapped_column, relationship, registry
 )
+from dotenv import load_dotenv
 
 from xxhash import xxh32_intdigest, xxh3_128_hexdigest
+
+# Load environment variables from .env file
+load_dotenv()
 
 reg = registry()
 
@@ -163,5 +168,10 @@ class File:
         return self.dir.full_path / self.name
 
 # ── async engine / session ───────────────────────────────────────────
-engine = create_async_engine("sqlite+aiosqlite:///fs_index.db", echo=False)
+# Get database path from environment variable or use default
+db_path = os.getenv("DB_PATH", "fs_index.db")
+# Expand ~ to user's home directory if present
+db_path = os.path.expanduser(db_path)
+# Create the SQLAlchemy engine with the configured path
+engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}", echo=False)
 AsyncSession = async_sessionmaker(engine, expire_on_commit=False)
