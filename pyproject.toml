@@ -1,5 +1,5 @@
 [project]
-name = "blustash"
+name = "bluestash"
 version = "0.0.1"
 description = "Add your description here"
 readme = "README.md"
@@ -8,5 +8,9 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "rich>=14.0.0",
     "sqlalchemy>=2.0.41",
+    "typer>=0.16.0",
     "xxhash>=3.5.0",
 ]
+
+[project.scripts]
+bluestash = "bluestash.cli:app"
