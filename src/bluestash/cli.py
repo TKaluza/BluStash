@@ -34,6 +34,7 @@ from bluestash.db.utils import (
     get_async_session,
     reset_all_valid_flags,  # Importiert
     delete_invalid_entries,  # Importiert
+    get_latest_session_info,
 )
 from bluestash import setup_logging
 
@@ -231,7 +232,7 @@ def scan_command(
                         scan_session,
                         progress_callback=update_file_progress,
                     )
-                    scan_session.total_files = processed
+                    scan_session.changed_files = processed
                     await session.flush()
                     progress_file.update(
                         file_task,
@@ -281,6 +282,69 @@ def scan_command(
                 raise typer.Exit(code=1)
 
     asyncio.run(_scan())
+
+
+@app.command(name="info")
+def info_command(
+    db_path: str = typer.Option(
+        None,
+        "--db-path",
+        "-d",
+        help="Path to the database file. By default, the value from the .env file is used.",
+    ),
+):
+    """
+    Display information about the latest BluStash scan session.
+
+    This command retrieves and displays details about the most recent scan session,
+    including:
+    - Session UUID
+    - Session ID (number)
+    - When the session was started
+    - Total files processed
+
+    If no sessions exist in the database, an appropriate message is displayed.
+    """
+
+    async def _info():
+        # If db_path is provided, set it as an environment variable
+        if db_path:
+            os.environ["DB_PATH"] = db_path
+            # Re-import engine with the updated environment variable
+            from bluestash.db.models import engine as updated_engine
+            current_engine = updated_engine
+        else:
+            current_engine = engine
+
+        try:
+            # Initialize database connection
+            async with current_engine.begin() as conn:
+                await conn.run_sync(reg.metadata.create_all)
+
+            # Get the latest session information
+            async with get_async_session() as session:
+                latest_session = await get_latest_session_info(session)
+
+                if latest_session:
+                    # Format the timestamp for display
+                    timestamp_str = latest_session['timestamp'].strftime('%Y-%m-%d %H:%M:%S %Z')
+
+                    # Display the information using rich formatting
+                    console.print("[bold blue]Latest BluStash Session Information:[/bold blue]")
+                    console.print(f"[green]Session UUID:[/green] {latest_session['uuid']}")
+                    console.print(f"[green]Session Number:[/green] {latest_session['id']}")
+                    console.print(f"[green]Started At:[/green] {timestamp_str}")
+                    console.print(f"[green]Changed Files Processed:[/green] {latest_session['changed_files']}")
+                else:
+                    console.print("[yellow]No scan sessions found in the database.[/yellow]")
+
+        except Exception as e:
+            error_msg = f"Error retrieving session information: {e}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            logger.error(error_msg, exc_info=True)
+            raise typer.Exit(code=1)
+
+    asyncio.run(_info())
 
 
 if __name__ == "__main__":

@@ -200,6 +200,7 @@ async def insert_files_with_progress(
         chunk_size (int): Number of files to process before committing a chunk to the database.
     """
     current_files_processed_ref = [0]
+    changed_files_count = 0
 
     file_processing_tasks = []
     for dir_path, dir_obj in dir_lookup.items():
@@ -243,6 +244,7 @@ async def insert_files_with_progress(
                     is_valid=True,
                 )
                 session.add(file_obj)
+                changed_files_count += 1
                 logger.debug(
                     f"Adding new file: {file_path.name} in {dir_obj.name}"
                     + (" (updated)" if existing_file_obj else "")
@@ -272,7 +274,7 @@ async def insert_files_with_progress(
         await session.commit()
         logger.debug(f"Committed final {current_files_processed_ref[0]} files.")
 
-    return current_files_processed_ref[0]
+    return changed_files_count
 
 
 async def reset_all_valid_flags(session):
@@ -311,3 +313,38 @@ async def delete_invalid_entries(session):
 
     await session.commit()
     logger.info("Invalid entries deleted.")
+
+
+async def get_latest_session_info(session):
+    """
+    Retrieves information about the latest scan session.
+
+    This function queries the database for the most recent ScanSession record
+    and returns its details including UUID, ID, and timestamp.
+
+    Args:
+        session: The database session to use for the query.
+
+    Returns:
+        dict: A dictionary containing the latest session information or None if no sessions exist.
+              The dictionary includes 'uuid', 'id', and 'timestamp' keys.
+    """
+    logger.debug("Retrieving latest session information...")
+
+    stmt = select(ScanSession).order_by(ScanSession.id.desc()).limit(1)
+    result = await session.execute(stmt)
+    latest_session = result.scalar_one_or_none()
+
+    if latest_session:
+        # Convert epoch timestamp to datetime for better readability
+        from datetime import datetime, timezone
+        timestamp_dt = datetime.fromtimestamp(latest_session.started_at, tz=timezone.utc)
+
+        return {
+            'uuid': latest_session.uuid,
+            'id': latest_session.id,
+            'timestamp': timestamp_dt,
+            'changed_files': latest_session.changed_files
+        }
+
+    return None

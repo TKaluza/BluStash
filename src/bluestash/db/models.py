@@ -14,7 +14,7 @@ Requirements:
 from __future__ import annotations
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 from sqlalchemy import (
     BigInteger,
@@ -37,6 +37,11 @@ load_dotenv()
 
 reg = registry()
 
+def current_epoch()->int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+def new_uuid()->str:
+    return str(uuid.uuid1())
 
 @reg.mapped_as_dataclass()
 class ScanSession:
@@ -46,12 +51,12 @@ class ScanSession:
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, init=False)
     uuid: Mapped[str] = mapped_column(
-        String(36), unique=True, nullable=False, default=lambda: str(uuid.uuid4())
+        String(36), unique=True, nullable=False, default_factory=new_uuid
     )
-    started_at: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=datetime.utcnow
+    started_at: Mapped[int] = mapped_column(
+        Integer, nullable=False, default_factory=current_epoch
     )
-    total_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    changed_files: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     files: Mapped[list["File"]] = relationship(
         back_populates="session", default_factory=list
@@ -70,7 +75,6 @@ class Dir:
     The model uses a self-referential relationship to represent the directory
     hierarchy, allowing for efficient traversal of the file system structure.
     """
-
     __tablename__ = "dir"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, init=False)
@@ -184,7 +188,6 @@ class File:
     session_id: Mapped[int] = mapped_column(
         ForeignKey("scan_session.id", ondelete="CASCADE"), init=False
     )
-    ancestor_id: Mapped[int | None] = mapped_column(ForeignKey("file.id"), default=None)
     name: Mapped[str] = mapped_column(String, nullable=False)
     size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     hash_xx128: Mapped[bytes] = mapped_column(LargeBinary(16), nullable=False)
@@ -192,6 +195,7 @@ class File:
     dir: Mapped["Dir"] = relationship(back_populates="files")
     session: Mapped["ScanSession"] = relationship(back_populates="files")
     ancestor: Mapped["File | None"] = relationship(remote_side=lambda: File.id)
+    ancestor_id: Mapped[int | None] = mapped_column(ForeignKey("file.id"), default=None)
     is_safed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_valid: Mapped[bool] = mapped_column(
         Boolean, default=True, nullable=False
