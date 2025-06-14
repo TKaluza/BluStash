@@ -18,13 +18,10 @@ import os
 from typing import Optional, Callable
 
 from bluestash.db.models import Dir, File, AsyncSession
+from bluestash import setup_logging
 
-logger = logging.getLogger("fs_index")
-logger.setLevel(logging.INFO)
-handler = logging.FileHandler("fs_index.log")
-formatter = logging.Formatter('%(asctime)s %(levelname)s %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
+# Set up logger using the standardized logging configuration
+logger = setup_logging(logger_name="fs_index")
 
 @asynccontextmanager
 async def get_async_session():
@@ -155,7 +152,8 @@ async def scan_dirs_and_build_lookup(start_path: Path, session,
 
 async def insert_files_with_progress(session, dir_lookup: dict,
                                      total_files: int,
-                                     progress_callback: Optional[Callable[[int, int], None]] = None):
+                                     progress_callback: Optional[Callable[[int, int], None]] = None,
+                                     chunk_size: int = 1000): # Hinzugefügter chunk_size Parameter
     """
     Insert all files from all directories into the database with xxHash128 and size.
     This function reports progress specifically for file insertion.
@@ -166,35 +164,50 @@ async def insert_files_with_progress(session, dir_lookup: dict,
         total_files (int): The total number of files expected (for progress).
         progress_callback (Callable[[int, int], None], optional):
             A callback function that will be called with (current_files, total_files).
+        chunk_size (int): Number of files to process before committing a chunk to the database.
     """
     current_files_processed_ref = [0] # Mutable list for callback
-    tasks = []
-
-    async def process_file(file_path: Path, dir_obj):
-        if file_path.is_symlink() or not file_path.is_file():
-            return
-        try:
-            size, hash_val = await get_size_and_hash(file_path)
-            file_obj = File(
-                name=file_path.name,
-                dir=dir_obj,
-                size=size,
-                hash_xx128=hash_val
-            )
-            session.add(file_obj)
-            current_files_processed_ref[0] += 1
-            if progress_callback:
-                progress_callback(current_files_processed_ref[0], total_files)
-        except Exception as e:
-            logger.error(f"Error reading {file_path}: {e}")
 
     file_processing_tasks = []
     for dir_path, dir_obj in dir_lookup.items():
         try:
             for entry in await asyncio.to_thread(lambda: list(dir_path.iterdir())):
                 if entry.is_file() and not entry.is_symlink():
-                    file_processing_tasks.append(process_file(entry, dir_obj))
+                    file_processing_tasks.append((entry, dir_obj))
         except Exception as e:
             logger.error(f"Error reading directory {dir_path}: {e}")
 
-    await asyncio.gather(*[asyncio.create_task(t) for t in file_processing_tasks])
+    # Process files in chunks
+    for i in range(0, len(file_processing_tasks), chunk_size):
+        chunk = file_processing_tasks[i:i + chunk_size]
+
+        tasks = []
+        for file_path, dir_obj in chunk:
+            async def process_single_file(fp: Path, do):
+                if fp.is_symlink() or not fp.is_file():
+                    return
+                try:
+                    size, hash_val = await get_size_and_hash(fp)
+                    file_obj = File(
+                        name=fp.name,
+                        dir=do,
+                        size=size,
+                        hash_xx128=hash_val
+                    )
+                    session.add(file_obj)
+                except Exception as e:
+                    logger.error(f"Error reading {fp}: {e}")
+
+            tasks.append(process_single_file(file_path, dir_obj))
+
+        await asyncio.gather(*tasks)
+        await session.commit() # Commit after each chunk
+
+        current_files_processed_ref[0] += len(chunk)
+        if progress_callback:
+            progress_callback(min(current_files_processed_ref[0], total_files), total_files) # Ensure progress doesn't exceed total
+
+    # Final commit for any remaining files if the last chunk was smaller than chunk_size
+    # (Though with the loop above, everything should be committed)
+    # This might not be strictly necessary if the loop handles all, but good for robustness.
+    await session.commit()

@@ -18,10 +18,14 @@ from dotenv import load_dotenv
 
 from bluestash.db.models import reg, engine
 from bluestash.db.utils import (count_dirs_and_files, scan_dirs_and_build_lookup, insert_files_with_progress, get_async_session)
+from bluestash import setup_logging
 
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Set up logger
+logger = setup_logging(logger_name="bluestash.cli")
 
 app = typer.Typer(help="Ein CLI-Tool zur Verwaltung des Dateisystemindex.")
 console = Console()
@@ -80,30 +84,41 @@ def scan_command(
             if env_basis_pfad:
                 basis_pfad = Path(env_basis_pfad)
                 if not basis_pfad.exists() or not basis_pfad.is_dir() or not os.access(basis_pfad, os.R_OK):
-                    console.print(f"[bold red]Fehler: Der in der .env-Datei angegebene Pfad '{env_basis_pfad}' existiert nicht, ist kein Verzeichnis oder ist nicht lesbar.[/bold red]")
+                    error_msg = f"Error: The path '{env_basis_pfad}' specified in the .env file does not exist, is not a directory, or is not readable."
+                    console.print(f"[bold red]{error_msg}[/bold red]")
+                    logger.error(error_msg)
                     raise typer.Exit(code=1)
             else:
-                console.print("[bold red]Fehler: Kein Basispfad angegeben und keine FOLDER_ENTRYPOINT-Variable in der .env-Datei gefunden.[/bold red]")
+                error_msg = "Error: No base path specified and no FOLDER_ENTRYPOINT variable found in the .env file."
+                console.print(f"[bold red]{error_msg}[/bold red]")
+                logger.error(error_msg)
                 raise typer.Exit(code=1)
 
         console.print("[bold green]Tabellen werden initialisiert...[/bold green]")
+        logger.info("Initializing database tables...")
         try:
             async with current_engine.begin() as conn:
                 await conn.run_sync(reg.metadata.create_all)
             console.print("[bold green]Tabellen sind bereit.[/bold green]")
+            logger.info("Database tables ready.")
         except Exception as e:
-            console.print(f"[bold red]Fehler bei der Initialisierung der Tabellen: {e}[/bold red]")
+            error_msg = f"Error initializing database tables: {e}"
+            console.print(f"[bold red]{error_msg}[/bold red]")
+            logger.error(error_msg, exc_info=True)
             raise typer.Exit(code=1)
 
         console.print(f"[bold blue]Starte Scan ab Pfad: {basis_pfad}[/bold blue]")
+        logger.info(f"Starting scan from path: {basis_pfad}")
 
         total_dirs, total_files = 0, 0
 
         # PHASE 1: Initial Counting (Spinner)
+        logger.info("Counting directories and files...")
         with console.status("[bold blue]Zähle Verzeichnisse und Dateien...", spinner="dots") as status:
             total_dirs, total_files = await count_dirs_and_files(basis_pfad)
             status.update("[bold green]Zählung abgeschlossen.[/bold green]")
         console.print(f"[bold green]Gefunden: {total_dirs} Verzeichnisse und {total_files} Dateien.[/bold green]")
+        logger.info(f"Found: {total_dirs} directories and {total_files} files.")
 
 
         # Use async context manager for database session
@@ -122,6 +137,7 @@ def scan_command(
                     transient=False, # Bleibt sichtbar, bis explizit gestoppt/entfernt
                 ) as progress_dir:
                     dir_task = progress_dir.add_task("[cyan]Verzeichnisse scannen...", total=total_dirs)
+                    logger.info("Scanning directories...")
 
                     def update_dir_progress(current_dirs: int, total: int):
                         progress_dir.update(dir_task, completed=current_dirs)
@@ -129,6 +145,7 @@ def scan_command(
                     dir_lookup = await scan_dirs_and_build_lookup(basis_pfad, session, total_dirs, progress_callback=update_dir_progress)
                     progress_dir.update(dir_task, completed=total_dirs, description="[green]Verzeichnisse gescannt.[/green]")
                     progress_dir.stop() # Beendet den Fortschrittsbalken für Verzeichnisse
+                    logger.info("Directory scanning completed.")
 
                 # PHASE 3: Intermediate Spinner (Vorbereitung zur Dateiverarbeitung)
                 with console.status("[bold magenta]Bereite Dateiverarbeitung vor...", spinner="dots") as status:
@@ -149,6 +166,7 @@ def scan_command(
                     transient=False, # Bleibt sichtbar, bis explizit gestoppt/entfernt
                 ) as progress_file:
                     file_task = progress_file.add_task("[yellow]Dateien verarbeiten...", total=total_files)
+                    logger.info("Processing files...")
 
                     def update_file_progress(current_files: int, total: int):
                         progress_file.update(file_task, completed=current_files)
@@ -156,22 +174,30 @@ def scan_command(
                     await insert_files_with_progress(session, dir_lookup, total_files, progress_callback=update_file_progress)
                     progress_file.update(file_task, completed=total_files, description="[green]Dateien verarbeitet.[/green]")
                     progress_file.stop() # Beendet den Fortschrittsbalken für Dateien
+                    logger.info("File processing completed.")
 
                 # PHASE 5: Finalizing (Spinner)
+                logger.info("Finalizing database transactions...")
                 with console.status("[bold green]Finalisiere Datenbank-Transaktionen...", spinner="dots") as status:
                     await session.commit() # Datenbank-Commit hier
                     status.update("[bold green]Datenbank-Transaktionen abgeschlossen.[/bold green]")
                     await asyncio.sleep(0.5) # Simuliert eine kurze abschließende Verzögerung
+                logger.info("Database transactions completed.")
 
                 console.print("[bold green]Scan abgeschlossen, Datenbank ist aktuell.[/bold green]")
+                logger.info("Scan completed, database is up to date.")
 
             except IntegrityError as e:
                 await session.rollback() # Rollback im Fehlerfall
-                console.print(f"[bold yellow]Integritätsfehler (vermutlich doppelte Einträge?): {e}[/bold yellow]")
+                error_msg = f"Integrity error (possibly duplicate entries): {e}"
+                console.print(f"[bold yellow]{error_msg}[/bold yellow]")
+                logger.error(error_msg)
                 raise typer.Exit(code=1)
             except Exception as e:
                 await session.rollback() # Rollback im Fehlerfall
-                console.print(f"[bold red]Allgemeiner Fehler während des Scans: {e}[/bold red]")
+                error_msg = f"General error during scan: {e}"
+                console.print(f"[bold red]{error_msg}[/bold red]")
+                logger.error(error_msg, exc_info=True)
                 raise typer.Exit(code=1)
 
     asyncio.run(_scan())
