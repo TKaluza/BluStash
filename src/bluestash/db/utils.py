@@ -218,13 +218,18 @@ async def insert_files_with_progress(session, dir_lookup: dict,
                 if existing_file_obj.hash_xx128 == hash_val:
                     # Hashes are the same, just mark as valid
                     existing_file_obj.is_valid = True
-                    logger.debug(f"File {file_path.name} in {dir_obj.name} exists and is valid. No update needed.")
+                    logger.debug(
+                        f"File {file_path.name} in {dir_obj.name} exists and is valid. No update needed."
+                    )
                 else:
-                    # Hashes are different, update file info
+                    # Hashes are different, update file info and mark as unsafed
                     existing_file_obj.size = size
                     existing_file_obj.hash_xx128 = hash_val
                     existing_file_obj.is_valid = True
-                    logger.debug(f"File {file_path.name} in {dir_obj.name} exists, but hash changed. Updating.")
+                    existing_file_obj.is_safed = False
+                    logger.debug(
+                        f"File {file_path.name} in {dir_obj.name} exists, but hash changed. Updating."
+                    )
             else:
                 # File does not exist, create new entry and add it to the session
                 file_obj = File(
@@ -232,7 +237,8 @@ async def insert_files_with_progress(session, dir_lookup: dict,
                     dir=dir_obj,
                     size=size,
                     hash_xx128=hash_val,
-                    is_valid=True
+                    is_valid=True,
+                    is_safed=False
                 )
                 session.add(file_obj) # Add the new file to the session immediately
                 logger.debug(f"Adding new file: {file_path.name} in {dir_obj.name}")
