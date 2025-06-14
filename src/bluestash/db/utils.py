@@ -172,7 +172,7 @@ async def scan_dirs_and_build_lookup(start_path: Path, session,
 async def insert_files_with_progress(session, dir_lookup: dict,
                                      total_files: int,
                                      progress_callback: Optional[Callable[[int, int], None]] = None,
-                                     chunk_size: int = 1000): # Hinzugefügter chunk_size Parameter
+                                     chunk_size: int = 1000):
     """
     Insert or update all files from all directories into the database with xxHash128 and size.
     This function reports progress specifically for file insertion.
@@ -185,7 +185,7 @@ async def insert_files_with_progress(session, dir_lookup: dict,
             A callback function that will be called with (current_files, total_files).
         chunk_size (int): Number of files to process before committing a chunk to the database.
     """
-    current_files_processed_ref = [0] # Mutable list for callback
+    current_files_processed_ref = [0]
 
     file_processing_tasks = []
     for dir_path, dir_obj in dir_lookup.items():
@@ -196,63 +196,66 @@ async def insert_files_with_progress(session, dir_lookup: dict,
         except Exception as e:
             logger.error(f"Error reading directory {dir_path}: {e}")
 
-    # Process files in chunks
-    for i in range(0, len(file_processing_tasks), chunk_size):
-        chunk = file_processing_tasks[i:i + chunk_size]
+    # Process files individually and add/update them. Flush/commit in chunks.
+    for i in range(0, len(file_processing_tasks)): # Iterate over individual files
+        file_path, dir_obj = file_processing_tasks[i] # Get one file at a time
 
-        tasks = []
-        for file_path, dir_obj in chunk:
-            async def process_single_file(fp: Path, do: Dir):
-                if fp.is_symlink() or not fp.is_file():
-                    return
-                try:
-                    size, hash_val = await get_size_and_hash(fp)
+        if file_path.is_symlink() or not file_path.is_file():
+            continue
+        try:
+            size, hash_val = await get_size_and_hash(file_path)
 
-                    # Try to find existing file
-                    stmt = select(File).where(
-                        (File.name == fp.name) &
-                        (File.dir_id == do.id)
-                    )
-                    result = await session.execute(stmt)
-                    existing_file_obj = result.scalar_one_or_none()
+            # Try to find existing file
+            stmt = select(File).where(
+                (File.name == file_path.name) &
+                (File.dir_id == dir_obj.id)
+            )
+            result = await session.execute(stmt)
+            existing_file_obj = result.scalar_one_or_none()
 
-                    if existing_file_obj:
-                        # File exists, check hash
-                        if existing_file_obj.hash_xx128 == hash_val:
-                            # Hashes are the same, just mark as valid
-                            existing_file_obj.is_valid = True
-                            logger.debug(f"File {fp.name} in {do.name} exists and is valid. No update needed.")
-                        else:
-                            # Hashes are different, update file info
-                            existing_file_obj.size = size
-                            existing_file_obj.hash_xx128 = hash_val
-                            existing_file_obj.is_valid = True
-                            logger.debug(f"File {fp.name} in {do.name} exists, but hash changed. Updating.")
-                    else:
-                        # File does not exist, create new entry
-                        file_obj = File(
-                            name=fp.name,
-                            dir=do,
-                            size=size,
-                            hash_xx128=hash_val,
-                            is_valid=True # New file, so it's valid
-                        )
-                        session.add(file_obj)
-                        logger.debug(f"Adding new file: {fp.name} in {do.name}")
-                except Exception as e:
-                    logger.error(f"Error processing file {fp}: {e}")
+            if existing_file_obj:
+                # File exists, check hash
+                if existing_file_obj.hash_xx128 == hash_val:
+                    # Hashes are the same, just mark as valid
+                    existing_file_obj.is_valid = True
+                    logger.debug(f"File {file_path.name} in {dir_obj.name} exists and is valid. No update needed.")
+                else:
+                    # Hashes are different, update file info
+                    existing_file_obj.size = size
+                    existing_file_obj.hash_xx128 = hash_val
+                    existing_file_obj.is_valid = True
+                    logger.debug(f"File {file_path.name} in {dir_obj.name} exists, but hash changed. Updating.")
+            else:
+                # File does not exist, create new entry and add it to the session
+                file_obj = File(
+                    name=file_path.name,
+                    dir=dir_obj,
+                    size=size,
+                    hash_xx128=hash_val,
+                    is_valid=True
+                )
+                session.add(file_obj) # Add the new file to the session immediately
+                logger.debug(f"Adding new file: {file_path.name} in {dir_obj.name}")
+        except Exception as e:
+            logger.error(f"Error processing file {file_path}: {e}")
 
-            tasks.append(process_single_file(file_path, dir_obj))
-
-        await asyncio.gather(*tasks)
-        await session.flush() # Flush after each chunk to ensure objects are tracked
-        await session.commit() # Commit after each chunk
-
-        current_files_processed_ref[0] += len(chunk)
+        # Increment processed count and report progress
+        current_files_processed_ref[0] += 1
         if progress_callback:
-            progress_callback(min(current_files_processed_ref[0], total_files), total_files) # Ensure progress doesn't exceed total
+            progress_callback(min(current_files_processed_ref[0], total_files), total_files)
 
-    # Final commit is implicitly handled by the loop.
+        # Flush and commit periodically based on chunk_size
+        if (i + 1) % chunk_size == 0:
+            await session.flush()
+            await session.commit()
+            logger.debug(f"Committed {current_files_processed_ref[0]} files.")
+
+    # Final flush and commit for any remaining files not part of a full chunk
+    if current_files_processed_ref[0] % chunk_size != 0 or len(file_processing_tasks) == 0:
+        await session.flush()
+        await session.commit()
+        logger.debug(f"Committed final {current_files_processed_ref[0]} files.")
+
 
 async def reset_all_valid_flags(session):
     """
