@@ -9,6 +9,7 @@ and database operations.
 The module uses asyncio for concurrent operations to improve performance
 when scanning large directory structures.
 """
+
 import asyncio
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -16,12 +17,13 @@ from xxhash import xxh3_128_hexdigest
 import os
 from typing import Optional, Callable
 
-from bluestash.db.models import Dir, File, AsyncSession
+from bluestash.db.models import Dir, File, ScanSession, AsyncSession
 from bluestash import setup_logging
 from sqlalchemy import select, update, delete
 
 # Set up logger using the standardized logging configuration
 logger = setup_logging(logger_name="fs_index")
+
 
 @asynccontextmanager
 async def get_async_session():
@@ -37,6 +39,7 @@ async def get_async_session():
     """
     async with AsyncSession() as session:
         yield session
+
 
 async def get_size_and_hash(file_path: Path):
     """
@@ -54,12 +57,14 @@ async def get_size_and_hash(file_path: Path):
             - size (int): Size of the file in bytes
             - hash_value (bytes): xxHash128 hash of the file content as bytes
     """
+
     def read_and_hash():
         with open(file_path, "rb") as f:
             data = f.read()
         size = len(data)  # Size based on the read bytes
         hash_val = bytes.fromhex(xxh3_128_hexdigest(data))
         return size, hash_val
+
     return await asyncio.to_thread(read_and_hash)
 
 
@@ -83,7 +88,9 @@ async def count_dirs_and_files(start_path: Path):
     file_count = 0
     loop = asyncio.get_running_loop()
 
-    for root, dirs, files in await loop.run_in_executor(None, lambda: list(os.walk(start_path, followlinks=False))):
+    for root, dirs, files in await loop.run_in_executor(
+        None, lambda: list(os.walk(start_path, followlinks=False))
+    ):
         dir_count += len(dirs)  # Unterverzeichnisse
         for d in dirs:
             d_path = Path(root) / d
@@ -99,9 +106,12 @@ async def count_dirs_and_files(start_path: Path):
     return dir_count, file_count
 
 
-async def scan_dirs_and_build_lookup(start_path: Path, session,
-                                     total_dirs: int,
-                                     progress_callback: Optional[Callable[[int, int], None]] = None) -> dict[Path, Dir]:
+async def scan_dirs_and_build_lookup(
+    start_path: Path,
+    session,
+    total_dirs: int,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> dict[Path, Dir]:
     """
     Recursively walk directory structure, add/update directories in the database, and build a lookup.
 
@@ -121,7 +131,7 @@ async def scan_dirs_and_build_lookup(start_path: Path, session,
         dict[Path, Dir]: A dictionary mapping Path objects to Dir objects.
     """
     dir_lookup = {}
-    current_dirs_processed = [0] # Mutable list for callback
+    current_dirs_processed = [0]  # Mutable list for callback
 
     async def walk_dirs_internal(path, parent_obj=None):
         if path.is_symlink():
@@ -139,19 +149,19 @@ async def scan_dirs_and_build_lookup(start_path: Path, session,
             # Update parent if it changed (shouldn't happen for same hash but good practice)
             if dir_obj.parent_id != (parent_obj.id if parent_obj else None):
                 dir_obj.parent = parent_obj
-            dir_obj.is_valid = True # Mark as valid for this scan
+            dir_obj.is_valid = True  # Mark as valid for this scan
             logger.debug(f"Updating existing directory: {path}")
         else:
             dir_obj = Dir(
                 name=path.name,
                 full_path_hash=full_path_hash,
                 parent=parent_obj,
-                is_valid=True # New directory, so it's valid
+                is_valid=True,  # New directory, so it's valid
             )
             session.add(dir_obj)
             logger.debug(f"Adding new directory: {path}")
 
-        await session.flush() # Ensure dir_obj gets its ID
+        await session.flush()  # Ensure dir_obj gets its ID
         dir_lookup[path] = dir_obj
 
         current_dirs_processed[0] += 1
@@ -169,10 +179,14 @@ async def scan_dirs_and_build_lookup(start_path: Path, session,
     return dir_lookup
 
 
-async def insert_files_with_progress(session, dir_lookup: dict,
-                                     total_files: int,
-                                     progress_callback: Optional[Callable[[int, int], None]] = None,
-                                     chunk_size: int = 1000):
+async def insert_files_with_progress(
+    session,
+    dir_lookup: dict,
+    total_files: int,
+    scan_session: ScanSession,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+    chunk_size: int = 1000,
+):
     """
     Insert or update all files from all directories into the database with xxHash128 and size.
     This function reports progress specifically for file insertion.
@@ -197,52 +211,51 @@ async def insert_files_with_progress(session, dir_lookup: dict,
             logger.error(f"Error reading directory {dir_path}: {e}")
 
     # Process files individually and add/update them. Flush/commit in chunks.
-    for i in range(0, len(file_processing_tasks)): # Iterate over individual files
-        file_path, dir_obj = file_processing_tasks[i] # Get one file at a time
+    for i in range(0, len(file_processing_tasks)):  # Iterate over individual files
+        file_path, dir_obj = file_processing_tasks[i]  # Get one file at a time
 
         if file_path.is_symlink() or not file_path.is_file():
             continue
         try:
             size, hash_val = await get_size_and_hash(file_path)
 
-            # Try to find existing file
-            stmt = select(File).where(
-                (File.name == file_path.name) &
-                (File.dir_id == dir_obj.id)
+            stmt = (
+                select(File)
+                .where((File.name == file_path.name) & (File.dir_id == dir_obj.id))
+                .order_by(File.id.desc())
             )
             result = await session.execute(stmt)
-            existing_file_obj = result.scalar_one_or_none()
+            existing_file_obj = result.scalars().first()
 
-            if existing_file_obj:
-                # File exists, check hash
-                if existing_file_obj.hash_xx128 == hash_val:
-                    # Hashes are the same, just mark as valid
-                    existing_file_obj.is_valid = True
-                    logger.debug(f"File {file_path.name} in {dir_obj.name} exists and is valid. No update needed.")
-                else:
-                    # Hashes are different, update file info
-                    existing_file_obj.size = size
-                    existing_file_obj.hash_xx128 = hash_val
-                    existing_file_obj.is_valid = True
-                    logger.debug(f"File {file_path.name} in {dir_obj.name} exists, but hash changed. Updating.")
+            if existing_file_obj and existing_file_obj.hash_xx128 == hash_val:
+                existing_file_obj.is_valid = True
+                logger.debug(
+                    f"File {file_path.name} in {dir_obj.name} exists and is valid. No update needed."
+                )
             else:
-                # File does not exist, create new entry and add it to the session
                 file_obj = File(
                     name=file_path.name,
                     dir=dir_obj,
                     size=size,
                     hash_xx128=hash_val,
-                    is_valid=True
+                    session=scan_session,
+                    ancestor=existing_file_obj if existing_file_obj else None,
+                    is_valid=True,
                 )
-                session.add(file_obj) # Add the new file to the session immediately
-                logger.debug(f"Adding new file: {file_path.name} in {dir_obj.name}")
+                session.add(file_obj)
+                logger.debug(
+                    f"Adding new file: {file_path.name} in {dir_obj.name}"
+                    + (" (updated)" if existing_file_obj else "")
+                )
         except Exception as e:
             logger.error(f"Error processing file {file_path}: {e}")
 
         # Increment processed count and report progress
         current_files_processed_ref[0] += 1
         if progress_callback:
-            progress_callback(min(current_files_processed_ref[0], total_files), total_files)
+            progress_callback(
+                min(current_files_processed_ref[0], total_files), total_files
+            )
 
         # Flush and commit periodically based on chunk_size
         if (i + 1) % chunk_size == 0:
@@ -251,10 +264,15 @@ async def insert_files_with_progress(session, dir_lookup: dict,
             logger.debug(f"Committed {current_files_processed_ref[0]} files.")
 
     # Final flush and commit for any remaining files not part of a full chunk
-    if current_files_processed_ref[0] % chunk_size != 0 or len(file_processing_tasks) == 0:
+    if (
+        current_files_processed_ref[0] % chunk_size != 0
+        or len(file_processing_tasks) == 0
+    ):
         await session.flush()
         await session.commit()
         logger.debug(f"Committed final {current_files_processed_ref[0]} files.")
+
+    return current_files_processed_ref[0]
 
 
 async def reset_all_valid_flags(session):
@@ -269,6 +287,7 @@ async def reset_all_valid_flags(session):
     await session.commit()
     logger.info("All 'is_valid' flags reset.")
 
+
 async def delete_invalid_entries(session):
     """
     Deletes Dir and File entries that still have is_valid=False after a scan.
@@ -277,7 +296,9 @@ async def delete_invalid_entries(session):
     logger.info("Deleting invalid entries (is_valid=False)...")
 
     # Delete files first, as they depend on directories
-    deleted_files_count = await session.execute(delete(File).where(File.is_valid == False))
+    deleted_files_count = await session.execute(
+        delete(File).where(File.is_valid == False)
+    )
     logger.info(f"Deleted {deleted_files_count.rowcount} invalid file entries.")
 
     # Delete directories next. Ensure directories are only deleted if they have no valid children or files.
